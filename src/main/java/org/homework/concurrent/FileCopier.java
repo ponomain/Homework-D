@@ -34,12 +34,20 @@ public class FileCopier {
      */
     public CompletableFuture<CopyReport> copyAll(Path manifest, Path sourceDirectory, Path targetDirectory,
                                                  int parallelism) {
+        return copyAll(manifest, sourceDirectory, targetDirectory, parallelism, new CopyControl());
+    }
+
+    /** То же, но вызывающий получает отмену и прогресс через переданный control (по одному на запуск). */
+    public CompletableFuture<CopyReport> copyAll(Path manifest, Path sourceDirectory, Path targetDirectory,
+                                                 int parallelism, CopyControl control) {
         Objects.requireNonNull(manifest, "manifest");
         Objects.requireNonNull(sourceDirectory, "sourceDirectory");
         Objects.requireNonNull(targetDirectory, "targetDirectory");
+        Objects.requireNonNull(control, "control");
         if (parallelism < 1) {
             throw new IllegalArgumentException("parallelism должен быть не меньше 1: " + parallelism);
         }
+        control.attach();
 
         ExecutorService executor = executorFactory.apply(parallelism);
         PathGuard guard = new PathGuard(sourceDirectory, targetDirectory);
@@ -48,8 +56,11 @@ public class FileCopier {
 
         CompletableFuture<CopyReport> work = CompletableFuture
                 .supplyAsync(() -> ManifestReader.read(manifest), executor)
-                .thenCompose(entries -> new CopyRun(entries, guard, transfer, executor, () -> false, result -> { })
-                        .start(parallelism))
+                .thenCompose(entries -> {
+                    control.setTotal(entries.size());
+                    return new CopyRun(entries, guard, transfer, executor, control::isCancelled, control::record)
+                            .start(parallelism);
+                })
                 .thenApply(results -> new CopyReport(results, Duration.ofNanos(System.nanoTime() - start)));
 
         return completeAfterTermination(work, executor);
