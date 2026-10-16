@@ -1,6 +1,5 @@
 package org.homework.concurrent;
 
-import java.io.File;
 import java.time.Duration;
 import java.util.Objects;
 

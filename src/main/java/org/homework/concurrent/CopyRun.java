@@ -2,6 +2,7 @@ package org.homework.concurrent;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -65,16 +66,29 @@ final class CopyRun {
                 .thenApply(ignored -> promises.stream().map(CompletableFuture::join).toList());
     }
 
+    /**
+     * Запускает цепочку следующей непройденной строки. Если цепочку не удалось даже поставить в очередь
+     * (исполнитель отклонил задачу), строка получает FAILED, а запуск продолжается циклом, а не рекурсией:
+     * иначе promise остался бы незавершённым и общий future завис бы навсегда.
+     */
     private void launchNext() {
-        int index = cursor.getAndIncrement();
-        if (index >= entries.size()) {
+        int index;
+        while ((index = cursor.getAndIncrement()) < entries.size()) {
+            ManifestEntry entry = entries.get(index);
+            CompletableFuture<FileResult> chain;
+            try {
+                chain = processFile(index, entry);
+            } catch (RuntimeException | Error e) {
+                promises.get(index).complete(internalFailure(entry, e));
+                continue;
+            }
+            int row = index;
+            chain.whenComplete((result, error) -> {
+                promises.get(row).complete(error == null ? result : internalFailure(entry, error));
+                launchNext();
+            });
             return;
         }
-        ManifestEntry entry = entries.get(index);
-        processFile(index, entry).whenComplete((result, error) -> {
-            promises.get(index).complete(error == null ? result : internalFailure(entry, error));
-            launchNext();
-        });
     }
 
     private CompletableFuture<FileResult> processFile(int index, ManifestEntry entry) {
@@ -96,7 +110,15 @@ final class CopyRun {
             throw new IllegalArgumentException("цель '" + entry.target() + "': этот целевой путь уже занят строкой "
                     + entries.get(duplicateOf[index]).line() + " манифеста");
         }
-        return new Resolved(guard.resolveSource(entry.source()), guard.resolveTarget(entry.target()));
+        Path source = guard.resolveSource(entry.source());
+        if (!Files.isRegularFile(source)) {
+            // устройство (NUL в Windows) или FIFO читаются "успешно" или бесконечно, поэтому их отсекаем заранее
+            String reason = Files.isDirectory(source) ? "это папка, а не файл"
+                    : Files.notExists(source) ? "файл не найден"
+                    : "это не обычный файл (устройство или специальный файл)";
+            throw new IllegalArgumentException("источник '" + entry.source() + "': " + reason);
+        }
+        return new Resolved(source, guard.resolveTarget(entry.target()));
     }
 
     private Staged stage(Resolved resolved) {

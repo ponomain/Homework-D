@@ -36,7 +36,7 @@ public record CopyReport(List<FileResult> results, Duration duration) {
     /** Сумма байт только успешно скопированных файлов. */
     public long totalBytes() {
         long sum = 0;
-        for(FileResult result: results) {
+        for (FileResult result : results) {
             if (result.status() == Status.COPIED) {
                 sum += result.bytes();
             }

@@ -74,6 +74,22 @@ public class PathGuardTest {
     }
 
     @Test
+    void rejectsTrailingDotComponentsOnWindows() {
+        assumeTrue(System.getProperty("os.name").toLowerCase().contains("win"), "только для Windows");
+        for (String path : List.of("a.txt.", "dir./x.txt", ".. .")) {
+            assertThrows(IllegalArgumentException.class, () -> guard.resolveSource(path), path);
+            assertThrows(IllegalArgumentException.class, () -> guard.resolveTarget(path), path);
+            assertThrows(IllegalArgumentException.class, () -> guard.lexicalTarget(path), path);
+        }
+    }
+
+    @Test
+    void lexicalTargetDetectsAliasesOfTheSameFile() {
+        assertEquals(guard.lexicalTarget("b.txt"), guard.lexicalTarget("a/../b.txt"));
+        assertEquals(guard.lexicalTarget("dir/x.txt"), guard.lexicalTarget("dir//x.txt"));
+    }
+
+    @Test
     void rejectsSymlinkLeadingOutsideSource() throws IOException {
         Path outside = Files.createDirectory(dir.resolve("outside"));
         Files.writeString(outside.resolve("secret.txt"), "x");

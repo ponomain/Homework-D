@@ -39,7 +39,7 @@ public final class FileTransfer {
                     bytes = transfer(in, out, cancelled);
                 }   // здесь поток уже закрыт, и ошибка close() тоже попадёт в catch ниже
                 return new TempCopy(temp, bytes);
-            } catch (IOException | RuntimeException e) {
+            } catch (Throwable e) {   // и Error тоже: временный файл не должен оставаться ни при каких сбоях
                 discardTemp(temp, e);
                 throw e;
             }
@@ -54,7 +54,7 @@ public final class FileTransfer {
             } catch (AtomicMoveNotSupportedException e) {
                 Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
             }
-        } catch (IOException | RuntimeException e) {
+        } catch (Throwable e) {
             discardTemp(temp, e);
             throw e;
         }

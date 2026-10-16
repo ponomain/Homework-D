@@ -1,5 +1,6 @@
 package org.homework.concurrent;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
@@ -58,6 +59,16 @@ public final class PathGuard {
         if (candidate.isAbsolute() || candidate.getRoot() != null) {
             throw rejected(what, relative, "абсолютные пути запрещены");
         }
+        if (File.separatorChar == '\\') {
+            // Windows молча отбрасывает хвостовые точки: "a.txt." это тот же файл, что "a.txt",
+            // и такие алиасы обходят проверку дубликатов
+            for (Path part : candidate) {
+                String name = part.toString();
+                if (name.endsWith(".") && !name.equals(".") && !name.equals("..")) {
+                    throw rejected(what, relative, "имя заканчивается точкой");
+                }
+            }
+        }
 
         Path resolved = root.resolve(candidate).normalize();
         if (!resolved.startsWith(root)) {
@@ -80,7 +91,7 @@ public final class PathGuard {
                 existing = existing.getParent();
             }
             if (existing == null || !existing.startsWith(root)) {
-                return;// под root ещё ничего не существует
+                return;   // под root ещё ничего не существует
             }
             if (!existing.toRealPath().startsWith(root.toRealPath())) {
                 throw rejected(what, relative, "путь через символическую ссылку выходит за пределы папки");

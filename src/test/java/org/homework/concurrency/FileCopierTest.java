@@ -1,5 +1,6 @@
 package org.homework.concurrency;
 
+import org.homework.concurrent.CopyControl;
 import org.homework.concurrent.CopyReport;
 import org.homework.concurrent.FileCopier;
 import org.homework.concurrent.FileResult;
@@ -9,22 +10,28 @@ import org.homework.concurrent.StreamOpener;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.FilterInputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.List;
 import java.util.Queue;
 import java.util.Random;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -40,6 +47,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class FileCopierTest {
 
@@ -359,6 +367,307 @@ class FileCopierTest {
         assertEquals(0, executorsCreated.get());
     }
 
+    // ---------- усиленные проверки по итогам ревью ----------
+
+    @Test
+    void everyStageRunsOnOurExecutor() throws Exception {
+        int files = 5;
+        String[] rows = new String[files];
+        for (int i = 0; i < files; i++) {
+            write("f" + i + ".bin", random(100));
+            rows[i] = "f" + i + ".bin,out/f" + i + ".bin";
+        }
+        manifest(rows);
+        AtomicReference<TrackingExecutor> executor = new AtomicReference<>();
+        FileCopier copier = new FileCopier(StreamOpener.files(), threads -> {
+            executor.set(new TrackingExecutor(threads));
+            return executor.get();
+        });
+
+        run(copier, 2);
+
+        // 1 чтение манифеста + 1 запуск окна цепочек + по 3 блокирующие стадии на файл (проверка путей, копия, перенос)
+        assertEquals(2 + 3L * files, executor.get().getCompletedTaskCount());
+    }
+
+    @Test
+    void futureStaysIncompleteWhileExecutorIsStillTerminating() throws Exception {
+        write("a.txt", random(100));
+        manifest("a.txt,a.txt");
+        CountDownLatch awaiting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FileCopier copier = new FileCopier(StreamOpener.files(), threads -> new TrackingExecutor(threads) {
+            @Override
+            public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+                awaiting.countDown();
+                release.await();
+                return super.awaitTermination(timeout, unit);
+            }
+        });
+
+        CompletableFuture<CopyReport> future = copier.copyAll(manifest, sourceDir, targetDir, 2);
+        assertTrue(awaiting.await(10, TimeUnit.SECONDS), "ожидание остановки исполнителя должно начаться");
+        assertFalse(future.isDone(), "future не должен завершиться, пока исполнитель не остановлен");
+        release.countDown();
+
+        assertTrue(future.get(30, TimeUnit.SECONDS).isSuccess());
+    }
+
+    @Test
+    void resultsKeepManifestOrderEvenIfTheFirstFileFinishesLast() throws Exception {
+        String[] rows = new String[6];
+        for (int i = 0; i < rows.length; i++) {
+            write("f" + i + ".bin", random(100));
+            rows[i] = "f" + i + ".bin,out/f" + i + ".bin";
+        }
+        manifest(rows);
+        CountDownLatch othersClosed = new CountDownLatch(5);
+        List<String> finishOrder = Collections.synchronizedList(new java.util.ArrayList<>());
+        FileCopier copier = new FileCopier(opener((path, in) -> {
+            String name = path.getFileName().toString();
+            return new FilterInputStream(in) {
+                private boolean first = true;
+
+                @Override
+                public int read(byte[] b, int off, int len) throws IOException {
+                    if (first && name.equals("f0.bin")) {
+                        first = false;
+                        awaitQuietly(othersClosed);   // первый файл ждёт, пока завершатся все остальные
+                    }
+                    return super.read(b, off, len);
+                }
+
+                @Override
+                public void close() throws IOException {
+                    try {
+                        super.close();
+                    } finally {
+                        finishOrder.add(name);
+                        if (!name.equals("f0.bin")) {
+                            othersClosed.countDown();
+                        }
+                    }
+                }
+            };
+        }), FileCopier::newPool);
+
+        CopyReport report = run(copier, 4);
+
+        assertEquals("f0.bin", finishOrder.get(finishOrder.size() - 1), "f0 должен закончиться последним: " + finishOrder);
+        assertEquals(List.of("f0.bin", "f1.bin", "f2.bin", "f3.bin", "f4.bin", "f5.bin"), sources(report));
+    }
+
+    @Test
+    void everyFileKeepsItsOwnContent() throws Exception {
+        int files = 60;
+        byte[][] data = new byte[files][];
+        String[] rows = new String[files];
+        for (int i = 0; i < files; i++) {
+            data[i] = random(500 + i, i);
+            write("f" + i + ".bin", data[i]);
+            rows[i] = "f" + i + ".bin,out/f" + i + ".bin";
+        }
+        manifest(rows);
+
+        CopyReport report = run(new FileCopier(), 6);
+
+        assertEquals(files, report.copied());
+        for (int i = 0; i < files; i++) {
+            assertArrayEquals(data[i], Files.readAllBytes(targetDir.resolve("out/f" + i + ".bin")), "f" + i);
+        }
+    }
+
+    @Test
+    void writeErrorThroughCopyAllFailsOnlyThatFileAndLeavesNoTemp() throws Exception {
+        for (int i = 0; i < 3; i++) {
+            write("f" + i + ".bin", random(1000));
+        }
+        manifest("f0.bin,f0.bin", "f1.bin,f1.bin", "f2.bin,f2.bin");
+        AtomicInteger outputs = new AtomicInteger();
+        FileCopier copier = new FileCopier(opener(
+                (path, in) -> in,
+                (path, out) -> outputs.incrementAndGet() == 2 ? new BrokenOutput(out) : out),
+                FileCopier::newPool);
+
+        CopyReport report = run(copier, 1);   // один поток, чтобы "вторым" всегда был f1
+
+        assertEquals(List.of(Status.COPIED, Status.FAILED, Status.COPIED), statuses(report));
+        assertTrue(report.results().get(1).error().contains("write error"), report.results().get(1).error());
+        assertFalse(Files.exists(targetDir.resolve("f1.bin")));
+        assertEquals(List.of(), tempFilesIn(targetDir));
+    }
+
+    @Test
+    void commitFailureThroughCopyAllFailsOnlyThatRow() throws Exception {
+        write("a.bin", random(100));
+        write("b.bin", random(100));
+        Files.createDirectories(targetDir.resolve("x.bin"));   // конечный путь занят непустой папкой
+        Files.writeString(targetDir.resolve("x.bin/keep.txt"), "keep");
+        manifest("a.bin,x.bin", "b.bin,b.bin");
+
+        CopyReport report = run(new FileCopier(), 2);
+
+        assertEquals(List.of(Status.FAILED, Status.COPIED), statuses(report));
+        assertEquals(List.of(), tempFilesIn(targetDir));
+        assertEquals("keep", Files.readString(targetDir.resolve("x.bin/keep.txt")));
+    }
+
+    @Test
+    void badManifestsCompleteExceptionallyAndStopTheExecutor() throws Exception {
+        for (String content : List.of("foo,bar\na,b\n", "source,target\nonly-one-value\n", "")) {
+            Files.writeString(manifest, content);
+            AtomicReference<ExecutorService> created = new AtomicReference<>();
+            FileCopier copier = new FileCopier(StreamOpener.files(), threads -> {
+                created.set(new TrackingExecutor(threads));
+                return created.get();
+            });
+
+            ExecutionException ex = assertThrows(ExecutionException.class,
+                    () -> copier.copyAll(manifest, sourceDir, targetDir, 2).get(30, TimeUnit.SECONDS), content);
+
+            assertInstanceOf(ManifestException.class, ex.getCause(), content);
+            assertTrue(created.get().isTerminated(), content);
+        }
+    }
+
+    @Test
+    void emptyManifestStopsTheExecutor() throws Exception {
+        manifest();
+        AtomicReference<ExecutorService> created = new AtomicReference<>();
+        FileCopier copier = new FileCopier(StreamOpener.files(), threads -> {
+            created.set(new TrackingExecutor(threads));
+            return created.get();
+        });
+
+        run(copier, 3);
+
+        assertTrue(created.get().isTerminated());
+    }
+
+    @Test
+    void parallelismOneProcessesRowsInManifestOrder() throws Exception {
+        String[] rows = new String[6];
+        for (int i = 0; i < rows.length; i++) {
+            write("f" + i + ".bin", random(100));
+            rows[i] = "f" + i + ".bin,out/f" + i + ".bin";
+        }
+        manifest(rows);
+        List<String> opened = Collections.synchronizedList(new java.util.ArrayList<>());
+        FileCopier copier = new FileCopier(opener((path, in) -> {
+            opened.add(path.getFileName().toString());
+            return in;
+        }), FileCopier::newPool);
+
+        run(copier, 1);
+
+        assertEquals(List.of("f0.bin", "f1.bin", "f2.bin", "f3.bin", "f4.bin", "f5.bin"), opened);
+    }
+
+    @Test
+    void tenThousandFastFailingRowsDoNotOverflowTheStack() throws Exception {
+        StringBuilder rows = new StringBuilder("source,target\n");
+        for (int i = 0; i < 10_000; i++) {
+            rows.append("missing").append(i).append(".bin,out/").append(i).append(".bin\n");
+        }
+        Files.writeString(manifest, rows);
+        CopyControl control = new CopyControl();
+
+        CopyReport report = new FileCopier().copyAll(manifest, sourceDir, targetDir, 8, control)
+                .get(120, TimeUnit.SECONDS);
+
+        assertEquals(10_000, report.failed());
+        assertEquals(new CopyControl.Progress(10_000, 10_000, 0), control.progress());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
+    void rejectingExecutorDoesNotHangTheFuture(int rejectAt) throws Exception {
+        String[] rows = new String[6];
+        for (int i = 0; i < rows.length; i++) {
+            write("f" + i + ".bin", random(100));
+            rows[i] = "f" + i + ".bin,out/f" + i + ".bin";
+        }
+        manifest(rows);
+        AtomicInteger calls = new AtomicInteger();
+        FileCopier copier = new FileCopier(StreamOpener.files(), threads -> new TrackingExecutor(threads) {
+            @Override
+            public void execute(Runnable command) {
+                if (calls.incrementAndGet() == rejectAt) {
+                    throw new RejectedExecutionException("simulated rejection #" + rejectAt);
+                }
+                super.execute(command);
+            }
+        });
+
+        CopyReport report = run(copier, 2);   // главное: не зависает; отказ отрабатывается на вызывающем потоке
+
+        assertEquals(6, report.results().size());
+        assertTrue(report.isSuccess(), report.toString());
+    }
+
+    @Test
+    void cancellingTheReturnedFutureCancelsTheRun() throws Exception {
+        for (int i = 0; i < 6; i++) {
+            write("f" + i + ".bin", random(1000));
+        }
+        manifest("f0.bin,f0.bin", "f1.bin,f1.bin", "f2.bin,f2.bin", "f3.bin,f3.bin", "f4.bin,f4.bin", "f5.bin,f5.bin");
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<ExecutorService> created = new AtomicReference<>();
+        FileCopier copier = new FileCopier(opener((path, in) -> new FilterInputStream(in) {
+            private boolean first = true;
+
+            @Override
+            public int read(byte[] b, int off, int len) throws IOException {
+                if (first) {
+                    first = false;
+                    started.countDown();
+                    awaitQuietly(release);
+                }
+                return super.read(b, off, len);
+            }
+        }), threads -> {
+            created.set(FileCopier.newPool(threads));
+            return created.get();
+        });
+
+        CompletableFuture<CopyReport> future = copier.copyAll(manifest, sourceDir, targetDir, 1);
+        assertTrue(started.await(10, TimeUnit.SECONDS));
+        future.cancel(true);
+        release.countDown();
+
+        assertTrue(created.get().awaitTermination(30, TimeUnit.SECONDS), "пул должен остановиться");
+        assertEquals(List.of(), tempFilesIn(targetDir));
+        for (int i = 0; i < 6; i++) {
+            assertFalse(Files.exists(targetDir.resolve("f" + i + ".bin")), "f" + i + " не должен быть скопирован");
+        }
+    }
+
+    @Test
+    void directoryAsSourceFailsClearly() throws Exception {
+        Files.createDirectories(sourceDir.resolve("folder"));
+        write("ok.bin", random(10));
+        manifest("folder,out.bin", "ok.bin,ok.bin");
+
+        CopyReport report = run(new FileCopier(), 2);
+
+        assertEquals(List.of(Status.FAILED, Status.COPIED), statuses(report));
+        assertTrue(report.results().get(0).error().contains("папка"), report.results().get(0).error());
+        assertFalse(Files.exists(targetDir.resolve("out.bin")));
+    }
+
+    @Test
+    void deviceAsSourceFailsOnWindows() throws Exception {
+        assumeTrue(System.getProperty("os.name").toLowerCase().contains("win"), "только для Windows");
+        write("ok.bin", random(10));
+        manifest("NUL,out.bin", "ok.bin,ok.bin");
+
+        CopyReport report = run(new FileCopier(), 2);
+
+        assertEquals(List.of(Status.FAILED, Status.COPIED), statuses(report));
+        assertFalse(Files.exists(targetDir.resolve("out.bin")), "из устройства файл создаваться не должен");
+    }
+
     // ---------- helpers ----------
 
     private CopyReport run(FileCopier copier, int parallelism) throws Exception {
@@ -379,6 +688,52 @@ class FileCopierTest {
         byte[] data = new byte[size];
         new Random(7).nextBytes(data);
         return data;
+    }
+
+    private static byte[] random(int size, long seed) {
+        byte[] data = new byte[size];
+        new Random(seed).nextBytes(data);
+        return data;
+    }
+
+    private static StreamOpener opener(BiFunction<Path, InputStream, InputStream> input,
+                                       BiFunction<Path, OutputStream, OutputStream> output) {
+        return new StreamOpener() {
+            @Override
+            public InputStream openInput(Path path) throws IOException {
+                return input.apply(path, Files.newInputStream(path));
+            }
+
+            @Override
+            public OutputStream openOutput(Path path) throws IOException {
+                return output.apply(path, Files.newOutputStream(path));
+            }
+        };
+    }
+
+    private static void awaitQuietly(CountDownLatch latch) {
+        try {
+            latch.await(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Выходной поток, который не умеет записывать. */
+    private static final class BrokenOutput extends FilterOutputStream {
+        BrokenOutput(OutputStream out) {
+            super(out);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            throw new IOException("simulated write error");
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            throw new IOException("simulated write error");
+        }
     }
 
     private static List<String> sources(CopyReport report) {
@@ -433,7 +788,7 @@ class FileCopierTest {
     }
 
     /** Пул, который запоминает, сколько задач ждало в очереди в момент постановки новой. */
-    private static final class TrackingExecutor extends ThreadPoolExecutor {
+    private static class TrackingExecutor extends ThreadPoolExecutor {
         final AtomicInteger maxQueued = new AtomicInteger();
 
         TrackingExecutor(int threads) {
